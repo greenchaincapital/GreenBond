@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.17;
 
-import {IGauge} from "../interfaces/IGAUGE.sol";
-import {IPool} from "../interfaces/IPOOL.sol";
+import { IGauge } from "../interfaces/IGAUGE.sol";
+import { IPool } from "../interfaces/IPOOL.sol";
 
-import {ERC20} from "solmate/tokens/ERC20.sol";
-import {WETH} from "solmate/tokens/WETH.sol";
-import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
-import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
+import { ERC20 } from "solmate/tokens/ERC20.sol";
+import { WETH } from "solmate/tokens/WETH.sol";
+import { SafeTransferLib } from "solmate/utils/SafeTransferLib.sol";
+import { FixedPointMathLib } from "solmate/utils/FixedPointMathLib.sol";
 
 /**
  * Bond design:
@@ -16,15 +16,8 @@ import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
  * 2) Accept [USDC, USDT, Curve2CoinStablePoolToken(USDC/USDT)] tokens for deposits for ease of investment
  * 3) Treasurey Tokens are USDC / USDT (low risk)
  * 4) Rewards are fixed at 10% per year pro-rata
- * 5) Minimum lock-up period of investment
+ * 5) Minimum lock-up period of investment (6 months)
  * 6) All balances are in terms of Curve 2Pool (USDC/USDT) LP value, which mitigates dpeg attacks
- * Notes on Risks:
- * 0) Systemic risk of Chain
- * 1) This contract (e.g. re-entrancy or unforeseen hacks)
- * 2) Treasurey tokens value
- * 3) Underlying USD value
- * Notes on Improvements:
- * 1) Cross-chain deployment and chain risk management
  */
 
 /// @title GreenBond vault contract to provide liquidity and earn rewards
@@ -109,6 +102,8 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     event Compound(address indexed receiver, uint256 shares);
     event DeployedAssets(address indexed receiver, uint256 assets);
     event DepositAssets(address indexed sender, uint256 assets);
+    event RewardsClaimed(address indexed sender, address token, uint256 tokenAmount, uint256 shares);
+    event RewardsCompounded(address indexed sender, uint256 shares);
 
     /*//////////////////////////////////////////////////////////////
                                  CONSTRUCTOR
@@ -121,7 +116,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
                                  GOVERNANCE
     //////////////////////////////////////////////////////////////*/
 
-    function changeLockup(uint256 newLockup) external {
+    function changeLockup(uint64 newLockup) external {
         if (msg.sender != GOV) revert UnAuthorized();
         LOCKUP = newLockup;
     }
@@ -136,13 +131,13 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         FIXED_INTEREST = newInterest;
     }
 
-    function deployAssets(address token, address receiver, uint256 shares) external returns (uint256 tokenAmount) {
+    function deployAssets(address token, address receiver, uint256 shares) external {
         if (msg.sender != GOV) revert UnAuthorized();
         if (token != USDC && token != USDT && token != STABLE_POOL) revert UnknownToken();
         if (IGauge(GAUGE).balanceOf(address(this)) < shares) revert InsufficientLiquidity();
-        assets = previewRedeem(shares);
+        uint256 assets = previewRedeem(shares);
         if (_isZero(assets)) revert ZeroAmount();
-        tokenAmount = _beforeWithdraw(token, assets);
+        uint256 tokenAmount = _beforeWithdraw(token, assets);
 
         DEPLOYED_TOKENS += assets;
 
@@ -153,28 +148,15 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     function depositAssets(address token, uint256 tokenAmount) external {
         if (msg.sender != GOV) revert UnAuthorized();
-        if (ERC20(token).allowance(msg.sender) < tokenAmount) revert InsufficientAllowance();
-        uint256 amount; // amount in usdt
-        uint256 liquidity;
-        if (token == USDC || token == USDT) {
-            // Need to transfer before minting or ERC777s could reenter.
-            ERC20(token).safeTransferFrom(msg.sender, address(this), tokenAmount);
-            liquidity = _stakeLiquidity(token, tokenAmount);
-        } else if (token == STABLE_POOL) {
-            // Need to transfer before minting or ERC777s could reenter.
-            ERC20(token).safeTransferFrom(msg.sender, address(this), tokenAmount);
-            liquidity = tokenAmount;
-        } else {
-            revert UnknownToken();
-        }
-        shares = previewDeposit(liquidity);
-        if (_isZero(shares)) revert ZeroShares();
-        // deposit LP to curve
-        ERC20(STABLE_POOL).approve(GAUGE, liquidity);
-        IGauge(GAUGE).deposit(liquidity);
+        uint256 assets = _deposit(token, tokenAmount);
 
-        DEPLOYED_TOKENS -= liquidity;
-        emit DepositAssets(msg.sender, liquidity);
+        DEPLOYED_TOKENS -= assets;
+        emit DepositAssets(msg.sender, assets);
+    }
+
+    function recoverToken(address token, address receiver, uint256 tokenAmount) external {
+        if (msg.sender != GOV) revert UnAuthorized();
+        ERC20(token).safeTransfer(receiver, tokenAmount);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -187,25 +169,9 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     /// @param tokenAmount Amount of token to deposit
     /// @return shares returned to sender for deposit
     function deposit(address token, uint256 tokenAmount) external payable virtual returns (uint256 shares) {
-        if (ERC20(token).allowance(msg.sender) < tokenAmount) revert InsufficientAllowance();
-        uint256 amount; // amount in usdt
-        uint256 liquidity;
-        if (token == USDC || token == USDT) {
-            // Need to transfer before minting or ERC777s could reenter.
-            ERC20(token).safeTransferFrom(msg.sender, address(this), tokenAmount);
-            liquidity = _stakeLiquidity(token, tokenAmount);
-        } else if (token == STABLE_POOL) {
-            // Need to transfer before minting or ERC777s could reenter.
-            ERC20(token).safeTransferFrom(msg.sender, address(this), tokenAmount);
-            liquidity = tokenAmount;
-        } else {
-            revert UnknownToken();
-        }
-        shares = previewDeposit(liquidity);
+        uint256 assets = _deposit(token, tokenAmount);
+        shares = previewDeposit(assets);
         if (_isZero(shares)) revert ZeroShares();
-        // deposit LP to curve
-        ERC20(STABLE_POOL).approve(GAUGE, liquidity);
-        IGauge(GAUGE).deposit(liquidity);
 
         // Set the deposit timestamp for the user
         _updateDepositTimestamp(msg.sender, shares);
@@ -223,8 +189,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         } else {
             // multiple deposits, so weight timestamp by amounts
             unchecked {
-                depositTimestamps[account] =
-                    ((depositTimestamps[account] * prevBalance) + (block.timestamp * shares)) / (prevBalance + shares);
+                depositTimestamps[account] = ((depositTimestamps[account] * prevBalance) + (block.timestamp * shares)) / (prevBalance + shares);
             }
         }
     }
@@ -232,7 +197,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     /// @notice Withdraw shares for usdt. Requires sender to have approved vault to spend share amount
     /// @param token Either Usdt or Usdc
     /// @param shares Shares to withdraw
-    /// @return assets amount of usdt returned
+    /// @return tokenAmount amount of tokens returned
     function withdraw(address token, uint256 shares) public virtual returns (uint256 tokenAmount) {
         if (token != USDC && token != USDT && token != STABLE_POOL) revert UnknownToken();
         if (block.timestamp < depositTimestamps[msg.sender] + LOCKUP) revert InsufficientLockupTime();
@@ -241,7 +206,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         _compound();
         if (shares > balanceOf[msg.sender]) revert InsufficientBalance();
 
-        assets = previewRedeem(shares);
+        uint256 assets = previewRedeem(shares);
         if (_isZero(assets)) revert ZeroAmount();
 
         tokenAmount = _beforeWithdraw(token, assets);
@@ -257,14 +222,14 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         if (token != USDC && token != USDT && token != STABLE_POOL) revert UnknownToken();
         uint256 unclaimedRewards = _calculateUnclaimedRewards(msg.sender);
         if (_isZero(unclaimedRewards)) revert NoRewardsToClaim();
-        assets = previewRedeem(unclaimedRewards);
+        uint256 assets = previewRedeem(unclaimedRewards);
         if (_isZero(assets)) revert ZeroAmount();
 
         unchecked {
             rewards[msg.sender] += unclaimedRewards;
             lastClaimTimestamps[msg.sender] = block.timestamp;
         }
-        
+
         tokenAmount = _beforeWithdraw(token, assets);
         ERC20(token).safeTransfer(msg.sender, tokenAmount);
 
@@ -356,22 +321,23 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         IGauge(GAUGE).withdraw(assets, address(this), true);
         if (token == STABLE_POOL) return assets;
         // withdraw from Curve pool
-        uint128 index;
-        if (token == USDT_INDEX) index = 1;
-        return IPool(STABLE_POOL).remove_liquidity_one_coin(assets, index);
+        int128 index;
+        if (token == USDT) index = 1;
+        return IPool(STABLE_POOL).remove_liquidity_one_coin(assets, index, _tokenAmountFromAssets(index, assets));
     }
 
     /// @notice Adds liquidity to an currve 2 pool from USDT / USDC
-    /// @param assets amount of usdt
-    /// @return liquidity amount of liquidity token received, sent to msg.sender
-    function _stakeLiquidity(address token, uint256 assets) internal returns (uint256 liquidity) {
-        if (assets < 2000) revert InsufficientAsset();
-        uint256[] memory amounts = new uint256[2]();
-        if (token == USDT) amounts[USDT_INDEX] = assets;
-        else amounts[USDC_INDEX] = assets;
+    /// @param token token to stake
+    /// @param tokenAmount amount to stake
+    /// @return assets amount of liquidity token received, sent to msg.sender
+    function _stakeLiquidity(address token, uint256 tokenAmount) internal returns (uint256 assets) {
+        if (tokenAmount < 2000) revert InsufficientAsset();
+        uint256[2] memory amounts;
+        if (token == USDT) amounts[USDT_INDEX] = tokenAmount;
+        else amounts[USDC_INDEX] = tokenAmount;
         uint256 min_mint_amount = IPool(STABLE_POOL).calc_token_amount(amounts, true);
-        ERC20(token).approve(STABLE_POOL, assets);
-        liquidity = IPool(STABLE_POOL).add_liquidity(amounts, min_mint_amount);
+        ERC20(token).approve(STABLE_POOL, tokenAmount);
+        assets = IPool(STABLE_POOL).add_liquidity(amounts, 0);
     }
 
     /// @custom:gas Uint256 zero check gas saver
@@ -395,10 +361,28 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     }
 
     /// @notice Function to receive Ether. msg.data must be empty
-    receive() external payable virtual {}
+    receive() external payable virtual { }
 
     /// @notice Fallback function is called when msg.data is not empty
-    fallback() external payable {}
+    fallback() external payable { }
+
+    function _deposit(address token, uint256 tokenAmount) internal returns (uint256 assets) {
+        if (ERC20(token).allowance(msg.sender, address(this)) < tokenAmount) revert InsufficientAllowance();
+        if (token == USDC || token == USDT) {
+            // Need to transfer before minting or ERC777s could reenter.
+            ERC20(token).safeTransferFrom(msg.sender, address(this), tokenAmount);
+            assets = _stakeLiquidity(token, tokenAmount);
+        } else if (token == STABLE_POOL) {
+            // Need to transfer before minting or ERC777s could reenter.
+            ERC20(token).safeTransferFrom(msg.sender, address(this), tokenAmount);
+            assets = tokenAmount;
+        } else {
+            revert UnknownToken();
+        }
+        // deposit LP to curve
+        ERC20(STABLE_POOL).approve(GAUGE, assets);
+        IGauge(GAUGE).deposit(assets);
+    }
 
     /// @dev override erc20 transfer to update receiver deposit timestamp
     function transfer(address to, uint256 amount) public override returns (bool) {
@@ -418,11 +402,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     }
 
     /// @dev override erc20 transferFrom to update receiver deposit timestamp
-    function transferFrom(
-        address from,
-        address to,
-        uint256 amount
-    ) public override returns (bool) {
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
         uint256 allowed = allowance[from][msg.sender]; // Saves gas for limited approvals.
 
         if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
@@ -441,5 +421,4 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
         return true;
     }
-
 }
