@@ -2,10 +2,10 @@
 pragma solidity ^0.8.13;
 
 import "forge-std/Test.sol";
-import "../src/Counter.sol";
+import "../src/GreenBond.sol";
 
-contract CounterTest is Test {
-    Counter public counter;
+contract GreenBondTest is Test {
+    GreenBond public counter;
 
     function setUp() public {
         counter = new Counter();
