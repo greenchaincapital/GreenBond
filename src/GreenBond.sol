@@ -151,18 +151,25 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
         uint256 tokenAmount = _beforeWithdraw(token, assets);
 
-        DEPLOYED_TOKENS += assets;
-
-        emit DeployedAssets(receiver, assets);
+        unchecked {
+            DEPLOYED_TOKENS += assets;
+        }
 
         ERC20(token).safeTransfer(receiver, tokenAmount);
+
+        emit DeployedAssets(receiver, assets);
     }
 
     function depositAssets(address token, uint256 tokenAmount) external {
         _govCheck();
         uint256 assets = _deposit(token, tokenAmount);
-
-        DEPLOYED_TOKENS -= assets;
+        if (assets > DEPLOYED_TOKENS) {
+            delete DEPLOYED_TOKENS;
+        } else {
+            unchecked {
+                DEPLOYED_TOKENS -= assets;
+            }
+        }
         emit DepositAssets(msg.sender, assets);
     }
 
@@ -398,6 +405,8 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     function transfer(address to, uint256 amount) public override returns (bool) {
         balanceOf[msg.sender] -= amount;
 
+        _updateDepositTimestamp(to, amount);
+
         // Cannot overflow because the sum of all user
         // balances can't exceed the max uint256 value.
         unchecked {
@@ -405,8 +414,6 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         }
 
         emit Transfer(msg.sender, to, amount);
-
-        _updateDepositTimestamp(to, amount);
 
         return true;
     }
@@ -419,6 +426,8 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
         balanceOf[from] -= amount;
 
+        _updateDepositTimestamp(to, amount);
+
         // Cannot overflow because the sum of all user
         // balances can't exceed the max uint256 value.
         unchecked {
@@ -426,8 +435,6 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         }
 
         emit Transfer(from, to, amount);
-
-        _updateDepositTimestamp(to, amount);
 
         return true;
     }
