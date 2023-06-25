@@ -45,7 +45,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     error Overflow();
     error IdenticalAddresses();
     error InsufficientLockupTime();
-    error UnAuthorized();
+    error Unauthorized();
     error NoRewardsToClaim();
 
     /*//////////////////////////////////////////////////////////////
@@ -86,7 +86,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     mapping(address => uint256) private lastClaimTimestamps;
 
-    uint256 private constant YEAR_IN_SECONDS = 365 days;
+    uint256 public constant YEAR_IN_SECONDS = 365 days;
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -116,27 +116,39 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
                                  GOVERNANCE
     //////////////////////////////////////////////////////////////*/
 
+    function _govCheck() internal view {
+        if (msg.sender != GOV) revert Unauthorized();
+    }
+
     function changeLockup(uint64 newLockup) external {
-        if (msg.sender != GOV) revert UnAuthorized();
+        _govCheck();
         LOCKUP = newLockup;
     }
 
     function changeGov(address newGov) external {
-        if (msg.sender != GOV) revert UnAuthorized();
+        _govCheck();
         GOV = newGov;
     }
 
     function changeInterest(uint16 newInterest) external {
-        if (msg.sender != GOV) revert UnAuthorized();
+        _govCheck();
         FIXED_INTEREST = newInterest;
     }
 
-    function deployAssets(address token, address receiver, uint256 shares) external {
-        if (msg.sender != GOV) revert UnAuthorized();
+    function _tokenCheck(address token) internal pure {
         if (token != USDC && token != USDT && token != STABLE_POOL) revert UnknownToken();
-        if (IGauge(GAUGE).balanceOf(address(this)) < shares) revert InsufficientLiquidity();
-        uint256 assets = previewRedeem(shares);
+    }
+
+    function _liquidityCheck(uint256 assets) internal view {
         if (_isZero(assets)) revert ZeroAmount();
+        if (IGauge(GAUGE).balanceOf(address(this)) < assets) revert InsufficientLiquidity();
+    }
+
+    function deployAssets(address token, address receiver, uint256 shares) external {
+        _govCheck();
+        _tokenCheck(token);
+        uint256 assets = previewRedeem(shares);
+
         uint256 tokenAmount = _beforeWithdraw(token, assets);
 
         DEPLOYED_TOKENS += assets;
@@ -147,7 +159,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     }
 
     function depositAssets(address token, uint256 tokenAmount) external {
-        if (msg.sender != GOV) revert UnAuthorized();
+        _govCheck();
         uint256 assets = _deposit(token, tokenAmount);
 
         DEPLOYED_TOKENS -= assets;
@@ -155,7 +167,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     }
 
     function recoverToken(address token, address receiver, uint256 tokenAmount) external {
-        if (msg.sender != GOV) revert UnAuthorized();
+        _govCheck();
         ERC20(token).safeTransfer(receiver, tokenAmount);
     }
 
@@ -199,15 +211,15 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     /// @param shares Shares to withdraw
     /// @return tokenAmount amount of tokens returned
     function withdraw(address token, uint256 shares) public virtual returns (uint256 tokenAmount) {
-        if (token != USDC && token != USDT && token != STABLE_POOL) revert UnknownToken();
+        _tokenCheck(token);
         if (block.timestamp < depositTimestamps[msg.sender] + LOCKUP) revert InsufficientLockupTime();
-        if (IGauge(GAUGE).balanceOf(address(this)) < shares) revert InsufficientLiquidity();
 
-        _compound();
+        // compound rewards, add to shares
+        shares += _compound();
         if (shares > balanceOf[msg.sender]) revert InsufficientBalance();
 
         uint256 assets = previewRedeem(shares);
-        if (_isZero(assets)) revert ZeroAmount();
+        _liquidityCheck(assets);
 
         tokenAmount = _beforeWithdraw(token, assets);
 
@@ -219,11 +231,11 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     }
 
     function claimRewards(address token) external returns (uint256 tokenAmount) {
-        if (token != USDC && token != USDT && token != STABLE_POOL) revert UnknownToken();
+        _tokenCheck(token);
         uint256 unclaimedRewards = _calculateUnclaimedRewards(msg.sender);
         if (_isZero(unclaimedRewards)) revert NoRewardsToClaim();
         uint256 assets = previewRedeem(unclaimedRewards);
-        if (_isZero(assets)) revert ZeroAmount();
+        _liquidityCheck(assets);
 
         unchecked {
             rewards[msg.sender] += unclaimedRewards;
@@ -236,9 +248,9 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         emit RewardsClaimed(msg.sender, token, tokenAmount, unclaimedRewards);
     }
 
-    function _compound() internal {
-        uint256 unclaimedRewards = _calculateUnclaimedRewards(msg.sender);
-        if (_isZero(unclaimedRewards)) return;
+    function _compound() internal returns (uint256 unclaimedRewards) {
+        unclaimedRewards = _calculateUnclaimedRewards(msg.sender);
+        if (_isZero(unclaimedRewards)) return unclaimedRewards;
 
         unchecked {
             rewards[msg.sender] += unclaimedRewards;
@@ -268,7 +280,9 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     //////////////////////////////////////////////////////////////*/
 
     function totalAssets() public view virtual returns (uint256) {
-        return (DEPLOYED_TOKENS + IGauge(GAUGE).balanceOf(address(this)));
+        unchecked {
+            return (DEPLOYED_TOKENS + IGauge(GAUGE).balanceOf(address(this)));
+        }
     }
 
     function convertToShares(uint256 assets) public view virtual returns (uint256) {
@@ -311,11 +325,6 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
                           INTERNAL HOOKS LOGIC
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice token amount from assets
-    function _tokenAmountFromAssets(int128 tokenIndex, uint256 assets) internal view returns (uint256 tokenAmount) {
-        tokenAmount = IPool(STABLE_POOL).calc_withdraw_one_coin(assets, tokenIndex);
-    }
-
     function _beforeWithdraw(address token, uint256 assets) internal virtual returns (uint256) {
         // withdraw from Curve Gauge
         IGauge(GAUGE).withdraw(assets, address(this), true);
@@ -323,7 +332,8 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         // withdraw from Curve pool
         int128 index;
         if (token == USDT) index = 1;
-        return IPool(STABLE_POOL).remove_liquidity_one_coin(assets, index, _tokenAmountFromAssets(index, assets));
+        uint256 minTokenAmount = IPool(STABLE_POOL).calc_withdraw_one_coin(assets, index) * 98 / 100;
+        return IPool(STABLE_POOL).remove_liquidity_one_coin(assets, index, minTokenAmount);
     }
 
     /// @notice Adds liquidity to an currve 2 pool from USDT / USDC
@@ -335,9 +345,9 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         uint256[2] memory amounts;
         if (token == USDT) amounts[USDT_INDEX] = tokenAmount;
         else amounts[USDC_INDEX] = tokenAmount;
-        uint256 min_mint_amount = IPool(STABLE_POOL).calc_token_amount(amounts, true);
+        uint256 minMintAmount = IPool(STABLE_POOL).calc_token_amount(amounts, true) * 98 / 100;
         ERC20(token).approve(STABLE_POOL, tokenAmount);
-        assets = IPool(STABLE_POOL).add_liquidity(amounts, 0);
+        assets = IPool(STABLE_POOL).add_liquidity(amounts, minMintAmount);
     }
 
     /// @custom:gas Uint256 zero check gas saver
