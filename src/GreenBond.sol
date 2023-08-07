@@ -3,6 +3,7 @@ pragma solidity ^0.8.17;
 
 import { IGauge } from "../interfaces/IGAUGE.sol";
 import { IPool } from "../interfaces/IPOOL.sol";
+import { IPPA } from "../interfaces/IPPA.sol";
 
 import { ERC20 } from "solmate/tokens/ERC20.sol";
 import { WETH } from "solmate/tokens/WETH.sol";
@@ -47,6 +48,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     error InsufficientLockupTime();
     error Unauthorized();
     error NoRewardsToClaim();
+    error NotPpa();
 
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
@@ -86,6 +88,9 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     mapping(address => uint256) private lastClaimTimestamps;
 
+    mapping(address => bool) public isPpa;
+    mapping(address => IPPA) public ppas;
+
     uint256 public constant YEAR_IN_SECONDS = 365 days;
 
     /*//////////////////////////////////////////////////////////////
@@ -100,10 +105,11 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     event Claim(address indexed receiver, address token, uint256 amount, uint256 shares);
     event Compound(address indexed receiver, uint256 shares);
-    event DeployedAssets(address indexed receiver, uint256 assets);
-    event DepositAssets(address indexed sender, uint256 assets);
+    event PaidSuppliers(address indexed receiver, uint256 assets);
+    event ReceivedIncome(address indexed sender, uint256 assets);
     event RewardsClaimed(address indexed sender, address token, uint256 tokenAmount, uint256 shares);
     event RewardsCompounded(address indexed sender, uint256 shares);
+    event PpaRegistered(address indexed ppa);
 
     /*//////////////////////////////////////////////////////////////
                                  CONSTRUCTOR
@@ -118,6 +124,10 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     function _govCheck() internal view {
         if (msg.sender != GOV) revert Unauthorized();
+    }
+
+    function _ppaCheck() internal view {
+        if (msg.sender != GOV && !isPpa[msg.sender]) revert Unauthorized();
     }
 
     function changeLockup(uint64 newLockup) external {
@@ -144,24 +154,44 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
         if (IGauge(GAUGE).balanceOf(address(this)) < assets) revert InsufficientLiquidity();
     }
 
-    function deployAssets(address token, address receiver, uint256 shares) external {
+    /**
+     * @dev Registers a new PPA contract in the GreenBond.
+     */
+    function registerPpaContract(address ppa) external {
         _govCheck();
-        _tokenCheck(token);
-        uint256 assets = previewRedeem(shares);
+        require(ppa != address(0), "GreenBond: PPA address cannot be zero.");
+        require(isPpa[ppa] == false, "GreenBond: PPA contract already registered.");
 
-        uint256 tokenAmount = _beforeWithdraw(token, assets);
+        isPpa[ppa] = true;
+        ppas[ppa] = IPPA(ppa);
+
+        emit PpaRegistered(ppa);
+    }
+
+    function paySuppliers(address ppa, address token, uint256 tokenAmount) external {
+        _govCheck();
+        if (!isPpa[ppa]) revert NotPpa();
+        _tokenCheck(token);
+
+        uint256[2] memory amounts;
+        if (token == USDT) amounts[USDT_INDEX] = tokenAmount;
+        else amounts[USDC_INDEX] = tokenAmount;
+        uint256 assets = IPool(STABLE_POOL).calc_token_amount(amounts, true);
+        tokenAmount = _beforeWithdraw(token, assets);
 
         unchecked {
             DEPLOYED_TOKENS += assets;
         }
 
-        ERC20(token).safeTransfer(receiver, tokenAmount);
+        ERC20(token).approve(ppa, tokenAmount);
 
-        emit DeployedAssets(receiver, assets);
+        emit PaidSuppliers(ppa, assets);
+
+        ppas[ppa].paySupplier(token, tokenAmount);
     }
 
-    function depositAssets(address token, uint256 tokenAmount) external {
-        _govCheck();
+    function receiveIncome(address token, uint256 tokenAmount) external {
+        _ppaCheck();
         uint256 assets = _deposit(token, tokenAmount);
         if (assets > DEPLOYED_TOKENS) {
             delete DEPLOYED_TOKENS;
@@ -170,7 +200,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
                 DEPLOYED_TOKENS -= assets;
             }
         }
-        emit DepositAssets(msg.sender, assets);
+        emit ReceivedIncome(msg.sender, assets);
     }
 
     function recoverToken(address token, address receiver, uint256 tokenAmount) external {

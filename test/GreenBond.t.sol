@@ -97,52 +97,6 @@ contract GreenBondTest is Test {
         bond.withdraw(token, shares);
     }
 
-    function testDeployAssets(uint256 amount) public {
-        vm.assume(amount > 2000);
-        address token = bond.USDT();
-        vm.assume(amount < ERC20(token).totalSupply());
-        writeTokenBalance(address(this), token, amount);
-        ERC20(token).approve(address(bond), amount);
-        uint256 shares = bond.deposit(token, amount);
-        vm.prank(gov);
-        bond.deployAssets(token, gov, shares);
-        assertGt(ERC20(token).balanceOf(gov), 0);
-    }
-
-    function testDeployAssetsFail(uint256 amount) public {
-        vm.assume(amount > 2000);
-        address token = bond.USDT();
-        vm.assume(amount < ERC20(token).totalSupply());
-        writeTokenBalance(address(this), token, amount);
-        ERC20(token).approve(address(bond), amount);
-        uint256 shares = bond.deposit(token, amount);
-        vm.expectRevert();
-        bond.deployAssets(token, gov, shares);
-    }
-
-    function testDepositAssets(uint256 amount) public {
-        vm.assume(amount > 2000);
-        address token = bond.USDT();
-        vm.assume(amount < ERC20(token).totalSupply());
-        writeTokenBalance(gov, token, amount);
-        vm.prank(gov);
-        ERC20(token).approve(address(bond), amount);
-        vm.prank(gov);
-        bond.depositAssets(token, amount);
-        assertEq(ERC20(token).balanceOf(gov), 0);
-    }
-
-    function testDepositAssetsFail(uint256 amount) public {
-        vm.assume(amount > 2000);
-        address token = bond.USDT();
-        vm.assume(amount < ERC20(token).totalSupply());
-        writeTokenBalance(gov, token, amount);
-        vm.prank(gov);
-        ERC20(token).approve(address(bond), amount);
-        vm.expectRevert();
-        bond.depositAssets(token, amount);
-    }
-
     function testRecoverToken(uint256 amount) public {
         vm.assume(amount > 2000);
         address token = bond.USDT();
