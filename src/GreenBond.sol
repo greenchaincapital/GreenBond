@@ -3,7 +3,6 @@ pragma solidity ^0.8.17;
 
 import { IGauge } from "../interfaces/IGAUGE.sol";
 import { IPool } from "../interfaces/IPOOL.sol";
-import { IPPA } from "../interfaces/IPPA.sol";
 
 import { ERC20 } from "solmate/tokens/ERC20.sol";
 import { WETH } from "solmate/tokens/WETH.sol";
@@ -48,7 +47,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     error InsufficientLockupTime();
     error Unauthorized();
     error NoRewardsToClaim();
-    error NotPpa();
+    error NotProject();
 
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
@@ -56,6 +55,19 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     uint8 public constant USDC_INDEX = 0;
     uint8 public constant USDT_INDEX = 1;
+    /// @notice USDC address
+    address public constant USDC = 0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8;
+    /// @notice USDT address
+    address public constant USDT = 0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9;
+    /// @notice Curve 2 Pool (USDT / USDC)
+    address public constant STABLE_POOL = 0x7f90122BF0700F9E7e1F688fe926940E8839F353;
+    /// @notice Curve Gauge for 2 Pool (USDT / USDC)
+    address public constant GAUGE = 0xCE5F24B7A95e9cBa7df4B54E911B4A3Dc8CDAf6f;
+    uint256 public constant YEAR_IN_SECONDS = 365 days;
+
+    /*//////////////////////////////////////////////////////////////
+                               GLOBALS
+    //////////////////////////////////////////////////////////////*/
 
     /// @notice Fixed reward percent per year
     uint16 public FIXED_INTEREST = 10;
@@ -65,18 +77,6 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     /// @notice Governance address
     address public GOV;
-
-    /// @notice USDC address
-    address public constant USDC = 0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8;
-
-    /// @notice USDT address
-    address public constant USDT = 0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9;
-
-    /// @notice Curve 2 Pool (USDT / USDC)
-    address public constant STABLE_POOL = 0x7f90122BF0700F9E7e1F688fe926940E8839F353;
-
-    /// @notice Curve Gauge for 2 Pool (USDT / USDC)
-    address public constant GAUGE = 0xCE5F24B7A95e9cBa7df4B54E911B4A3Dc8CDAf6f;
 
     /// @notice Transient tokens deployed to project (~ 6 months lock-up)
     uint256 public DEPLOYED_TOKENS;
@@ -88,10 +88,22 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     mapping(address => uint256) private lastClaimTimestamps;
 
-    mapping(address => bool) public isPpa;
-    mapping(address => IPPA) public ppas;
+    /*//////////////////////////////////////////////////////////////
+                                PROJECTS
+    //////////////////////////////////////////////////////////////*/
 
-    uint256 public constant YEAR_IN_SECONDS = 365 days;
+    struct Project {
+        bool isActive;
+        bool isCompleted;
+        address admin;
+        uint128 totalAssetsSupplied;
+        uint128 totalAssetsRepaid;
+        string projectName;
+        string masterAgreement;
+    }
+
+    uint256 public projectCount;
+    mapping(uint256 => Project) public projects;
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -105,11 +117,11 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     event Claim(address indexed receiver, address token, uint256 amount, uint256 shares);
     event Compound(address indexed receiver, uint256 shares);
-    event PaidSuppliers(address indexed receiver, uint256 assets);
-    event ReceivedIncome(address indexed sender, uint256 assets);
+    event PaidProject(address admin, uint256 amount, uint256 projectId);
+    event ReceivedIncome(address indexed sender, uint256 assets, uint256 projectId);
     event RewardsClaimed(address indexed sender, address token, uint256 tokenAmount, uint256 shares);
     event RewardsCompounded(address indexed sender, uint256 shares);
-    event PpaRegistered(address indexed ppa);
+    event ProjectRegistered(uint256 indexed project);
 
     /*//////////////////////////////////////////////////////////////
                                  CONSTRUCTOR
@@ -124,10 +136,6 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
 
     function _govCheck() internal view {
         if (msg.sender != GOV) revert Unauthorized();
-    }
-
-    function _ppaCheck() internal view {
-        if (msg.sender != GOV && !isPpa[msg.sender]) revert Unauthorized();
     }
 
     function changeLockup(uint64 newLockup) external {
@@ -155,44 +163,69 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
     }
 
     /**
-     * @dev Registers a new PPA contract in the GreenBond.
+     * @dev Registers a new Project
      */
-    function registerPpaContract(address ppa) external {
+    function registerProject(address projectAdmin, string calldata projectName) external returns (uint256) {
         _govCheck();
-        require(ppa != address(0), "GreenBond: PPA address cannot be zero.");
-        require(isPpa[ppa] == false, "GreenBond: PPA contract already registered.");
+        if (projectAdmin == address(0)) revert ZeroAddress();
 
-        isPpa[ppa] = true;
-        ppas[ppa] = IPPA(ppa);
+        Project memory project;
+        project.admin = projectAdmin;
+        project.projectName = projectName;
 
-        emit PpaRegistered(ppa);
+        unchecked{
+            ++projectCount;
+        }
+
+        projects[projectCount] = project;
+
+        emit ProjectRegistered(projectCount);
+
+        return projectCount;
     }
 
-    function paySuppliers(address ppa, address token, uint256 tokenAmount) external {
+    function linkProjectAgreement(uint256 projectId, string calldata masterAgreement) external {
         _govCheck();
-        if (!isPpa[ppa]) revert NotPpa();
-        _tokenCheck(token);
+        projects[projectId].masterAgreement = masterAgreement;
+    }
 
+    function completeProject(uint256 projectId) external {
+        _govCheck();
+        if (projects[projectId].totalAssetsRepaid > projects[projectId].totalAssetsSupplied) {
+            projects[projectId].isCompleted = true;
+        }
+    }
+
+    function payProject(address token, uint256 tokenAmount, uint256 projectId) external {
+        _govCheck();
+        if (projectId > projectCount) revert NotProject();
+        _tokenCheck(token);
+        if (!projects[projectId].isActive) {
+            projects[projectId].isActive = true;
+        }
         uint256[2] memory amounts;
         if (token == USDT) amounts[USDT_INDEX] = tokenAmount;
         else amounts[USDC_INDEX] = tokenAmount;
-        uint256 assets = IPool(STABLE_POOL).calc_token_amount(amounts, true);
+        uint256 assets = IPool(STABLE_POOL).calc_token_amount(amounts, false) * 998/1000;
+        projects[projectId].totalAssetsSupplied += uint128(assets);
+
         tokenAmount = _beforeWithdraw(token, assets);
 
         unchecked {
             DEPLOYED_TOKENS += assets;
         }
 
-        ERC20(token).approve(ppa, tokenAmount);
+        ERC20(token).approve(projects[projectId].admin, tokenAmount);
 
-        emit PaidSuppliers(ppa, assets);
+        emit PaidProject(projects[projectId].admin, assets, projectId);
 
-        ppas[ppa].paySupplier(token, tokenAmount);
+        ERC20(token).safeTransfer(projects[projectId].admin, tokenAmount);
     }
 
-    function receiveIncome(address token, uint256 tokenAmount) external {
-        _ppaCheck();
+    function receiveIncome(address token, uint256 tokenAmount, uint256 projectId) external {
+        _tokenCheck(token);
         uint256 assets = _deposit(token, tokenAmount);
+        projects[projectId].totalAssetsRepaid += uint128(assets);
         if (assets > DEPLOYED_TOKENS) {
             delete DEPLOYED_TOKENS;
         } else {
@@ -200,7 +233,7 @@ contract GreenBond is ERC20("GreenBond", "gBOND", 18) {
                 DEPLOYED_TOKENS -= assets;
             }
         }
-        emit ReceivedIncome(msg.sender, assets);
+        emit ReceivedIncome(msg.sender, assets, projectId);
     }
 
     function recoverToken(address token, address receiver, uint256 tokenAmount) external {
