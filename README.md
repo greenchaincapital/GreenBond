@@ -2,6 +2,8 @@
 
 ### Green Bond Contract on Arbitrum ([ERC4626 compatible](https://ethereum.org/en/developers/docs/standards/tokens/erc-4626/))
 
+### Deployed on Arbitrum at [0x8C1a46C0fDEAEeA9958984FAf8B0DCC01D2d0CA1](https://arbiscan.io/address/0x8C1a46C0fDEAEeA9958984FAf8B0DCC01D2d0CA1)
+
 ## GreenBond Summary
 
 The GreenBond contract is designed to provide liquidity and rewards to users who deposit stablecoins and LP tokens from the Curve 2Pool (USDT/USDC) pool. It offers a fixed annual reward percentage and enforces a minimum lock-up period for deposited assets. Additionally, it supports rewards compounding and allows governance to manage contract parameters and recover tokens.
